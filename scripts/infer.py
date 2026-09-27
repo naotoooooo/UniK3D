@@ -17,7 +17,9 @@ def save(rgb, outputs, name, base_path, save_map=False, save_pointcloud=False):
 
     os.makedirs(base_path, exist_ok=True)
 
-    depth = outputs["depth"]
+    # depth = outputs["depth"]
+    depth = outputs["distance"]
+
     rays = outputs["rays"]
     points = outputs["points"]
 
