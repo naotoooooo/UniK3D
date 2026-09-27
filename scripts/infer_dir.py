@@ -30,7 +30,7 @@ def save(
 
     if save_map:
         depth = outputs["distance"].cpu().numpy()
-        depth = outputs["depth"].cpu().numpy()
+        # depth = outputs["depth"].cpu().numpy()
         # fixed vmin/vmax keeps colors comparable across images
         Image.fromarray(colorize(depth.squeeze(), vmin=vmin, vmax=vmax)).save(
             os.path.join(base_path, f"{name}_depth.png")
