@@ -21,3 +21,4 @@ ___*.py
 *.png
 *.jpg
 COLCON_IGNORE
+timing.json
