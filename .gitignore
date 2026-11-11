@@ -17,3 +17,6 @@ ___*.py
 
 # ignore data
 /data
+
+*.png
+*.jpg
