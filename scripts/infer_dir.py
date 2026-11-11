@@ -24,6 +24,7 @@ def save(
     save_pointcloud=False,
     vmin=None,
     vmax=None,
+    vmax_percentile=-1.0,
 ):
     # as infer.save, without the rays map
     os.makedirs(base_path, exist_ok=True)
@@ -31,9 +32,11 @@ def save(
     if save_map:
         depth = outputs["distance"].cpu().numpy()
         # depth = outputs["depth"].cpu().numpy()
+        if vmax_percentile > 0.0:
+            vmax = percentile_vmax(depth, vmax_percentile)
         # fixed vmin/vmax keeps colors comparable across images
         Image.fromarray(colorize(depth.squeeze(), vmin=vmin, vmax=vmax)).save(
-            os.path.join(base_path, f"{name}_depth.png")
+            os.path.join(base_path, f"{name}_depth.jpg"), quality=95
         )
 
     if save_pointcloud:
@@ -41,6 +44,14 @@ def save(
         predictions_3d = points.permute(0, 2, 3, 1).reshape(-1, 3).cpu().numpy()
         rgb = rgb.permute(1, 2, 0).reshape(-1, 3).cpu().numpy()
         save_file_ply(predictions_3d, rgb, os.path.join(base_path, f"{name}.ply"))
+
+
+def percentile_vmax(depth, p):
+    # far end of the color range at the p-th percentile of the valid depths
+    # (colorize's invalid < 1e-4 left out); anything farther saturates to
+    # the darkest color instead of washing out the rest of the image
+    valid = depth[depth >= 0.0001]
+    return float(np.percentile(valid, p)) if valid.size else None
 
 
 def collect_images(input_dir):
@@ -56,6 +67,49 @@ def elapsed(since):
     if torch.cuda.is_available():
         torch.cuda.synchronize()
     return time.perf_counter() - since
+
+
+def load_rgb(image_path):
+    return torch.from_numpy(np.array(Image.open(image_path))).permute(2, 0, 1)
+
+
+def network_input_shape(model, rgb_torch, camera):
+    # run infer once, recording the (H, W) the network actually sees after
+    # infer's pad + resize, which is what resolution_level controls
+    shapes = []
+    encode_decode = model.encode_decode
+
+    def recording(inputs, *args, **kwargs):
+        shapes.append(tuple(inputs["image"].shape[-2:]))
+        return encode_decode(inputs, *args, **kwargs)
+
+    model.encode_decode = recording
+    try:
+        model.infer(rgb=rgb_torch, camera=camera, normalize=True, rays=None)
+    finally:
+        del model.encode_decode
+    return shapes[0]
+
+
+def summarize(times):
+    ms = np.asarray(times) * 1000.0
+    return {
+        "mean_ms": float(ms.mean()),
+        "std_ms": float(ms.std(ddof=1)) if len(ms) > 1 else 0.0,
+        "median_ms": float(np.median(ms)),
+        "min_ms": float(ms.min()),
+        "max_ms": float(ms.max()),
+        "fps": float(1000.0 / ms.mean()),
+    }
+
+
+def format_stats(s):
+    return (
+        f"mean {s['mean_ms']:.2f} ± {s['std_ms']:.2f} ms, "
+        f"median {s['median_ms']:.2f} ms, "
+        f"min {s['min_ms']:.2f} / max {s['max_ms']:.2f} ms, "
+        f"{s['fps']:.2f} FPS"
+    )
 
 
 if __name__ == "__main__":
@@ -84,7 +138,7 @@ if __name__ == "__main__":
         help="Path to camera parameters json file, applied to every image. See assets/demo for a few examples. The file needs a 'name' field with the camera model from unik3d/utils/camera.py and a 'params' field with the camera parameters as in the corresponding class docstring.",
     )
     parser.add_argument(
-        "--save", action="store_true", help="Save outputs as (colorized) png."
+        "--save", action="store_true", help="Save outputs as (colorized) jpg."
     )
     parser.add_argument(
         "--save-ply", action="store_true", help="Save pointcloud as ply."
@@ -114,6 +168,18 @@ if __name__ == "__main__":
         type=float,
         default=30.0,
         help="Distance in meters mapped to the darkest color. Pass a negative value to normalize per image instead.",
+    )
+    parser.add_argument(
+        "--vmax-percentile",
+        type=float,
+        default=60.0,
+        help="Far end of the color range at this percentile of each image's depths, overriding --vmax; farther depths saturate to the darkest color. Pass a negative value to use --vmax instead.",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=10,
+        help="Untimed inferences on the first image before timing, to exclude CUDA init and kernel selection.",
     )
     args = parser.parse_args()
 
@@ -151,10 +217,20 @@ if __name__ == "__main__":
         assert camera_name in ["Fisheye624", "Spherical", "OPENCV", "Pinhole", "MEI"]
         camera = eval(camera_name)(params=params)
 
-    times_infer, times_save = [], []
+    # model.infer crops/resizes the camera in place, so every call gets a fresh copy
+    fresh_camera = lambda: camera.clone() if camera is not None else None
+
+    rgb_first = load_rgb(image_paths[0])
+    infer_shape = network_input_shape(model, rgb_first, fresh_camera())
+    for _ in range(args.warmup):
+        model.infer(rgb=rgb_first, camera=fresh_camera(), normalize=True, rays=None)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    times_infer, times_save, input_shapes = [], [], set()
     for i, image_path in enumerate(image_paths):
-        rgb = np.array(Image.open(image_path))
-        rgb_torch = torch.from_numpy(rgb).permute(2, 0, 1)
+        rgb_torch = load_rgb(image_path)
+        input_shapes.add(tuple(rgb_torch.shape[-2:]))
 
         # model.infer crops/resizes the camera in place, so hand it a fresh copy
         camera_image = camera.clone() if camera is not None else None
@@ -175,17 +251,57 @@ if __name__ == "__main__":
             save_pointcloud=args.save_ply,
             vmin=vmin,
             vmax=vmax,
+            vmax_percentile=args.vmax_percentile,
         )
         times_save.append(elapsed(start))
 
         print(
             f"[{i + 1}/{len(image_paths)}] {image_path}: "
-            f"infer {times_infer[-1]:.2f}s, save {times_save[-1]:.2f}s"
+            f"infer {times_infer[-1] * 1000:.2f}ms, save {times_save[-1] * 1000:.2f}ms"
         )
 
+    environment = {
+        "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "cudnn": torch.backends.cudnn.version(),
+        # UniK3D.infer runs under fp16 autocast whenever CUDA is available
+        "precision": "fp16 autocast" if device.type == "cuda" else "fp32",
+        "model": name,
+        "resolution_level": args.resolution_level,
+        "interpolation_mode": args.interpolation_mode,
+        "input_hw": sorted(input_shapes),
+        "network_input_hw": infer_shape,
+        "batch_size": 1,
+        "num_images": len(image_paths),
+        "warmup": args.warmup,
+    }
+    stats_infer, stats_save = summarize(times_infer), summarize(times_save)
+
+    print("\nEnvironment:")
+    for key, value in environment.items():
+        print(f"  {key}: {value}")
+    if len(input_shapes) > 1:
+        print("  (inputs differ in size: network_input_hw is for the first image only)")
     print(
-        f"\nTotal for {len(image_paths)} images: "
-        f"load {time_load:.2f}s, "
-        f"infer {sum(times_infer):.2f}s (mean {np.mean(times_infer):.2f}s), "
-        f"save {sum(times_save):.2f}s (mean {np.mean(times_save):.2f}s)"
+        "\nInfer (H2D + pre/post-process + network, excl. image decode): "
+        f"{format_stats(stats_infer)}"
     )
+    print(f"Save: {format_stats(stats_save)}")
+
+    os.makedirs(args.output, exist_ok=True)
+    with open(os.path.join(args.output, "timing.json"), "w") as f:
+        json.dump(
+            {
+                "environment": environment,
+                "load_s": time_load,
+                "infer": stats_infer,
+                "save": stats_save,
+                "per_image_ms": {
+                    os.path.basename(p): {"infer": ti * 1000, "save": ts * 1000}
+                    for p, ti, ts in zip(image_paths, times_infer, times_save)
+                },
+            },
+            f,
+            indent=2,
+        )
